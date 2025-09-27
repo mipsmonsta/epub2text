@@ -27,8 +27,137 @@ try:
 except Exception:  # pragma: no cover
     pypandoc = None  # type: ignore
 
+try:
+    import html2text  # type: ignore
+except Exception:  # pragma: no cover
+    html2text = None  # type: ignore
+
 def clean_html(html):
     """Convert HTML to plain text preserving line breaks and marking headings without extra blanks inside paragraphs."""
+    # Use html2text if available for best paragraph preservation, then BeautifulSoup, then regex
+    if html2text is not None:
+        return clean_html_with_html2text(html)
+    elif BeautifulSoup is not None:
+        return clean_html_with_beautifulsoup(html)
+    else:
+        return clean_html_regex(html)
+
+def clean_html_with_html2text(html):
+    """Use html2text library for optimal HTML to text conversion with paragraph preservation."""
+    # Configure html2text for optimal EPUB conversion
+    h = html2text.HTML2Text()
+    h.ignore_links = True
+    h.ignore_images = True
+    h.ignore_emphasis = False  # Keep bold/italic for headings
+    h.body_width = 0  # Don't wrap lines
+    h.unicode_snob = True
+    h.escape_snob = True
+    h.mark_code = False
+    
+    # Convert HTML to text
+    text = h.handle(html)
+    
+    # Convert markdown-style headings to our custom format
+    lines = []
+    for line in text.split('\n'):
+        line = line.strip()
+        if line.startswith('# '):
+            lines.append(f"=== {line[2:].strip()} ===")
+        elif line.startswith('## '):
+            lines.append(f"== {line[3:].strip()} ==")
+        elif line.startswith('### '):
+            lines.append(f"-- {line[4:].strip()} --")
+        elif line.startswith('#### '):
+            lines.append(f"-- {line[5:].strip()} --")
+        elif line.startswith('##### '):
+            lines.append(f"-- {line[6:].strip()} --")
+        elif line.startswith('###### '):
+            lines.append(f"-- {line[7:].strip()} --")
+        else:
+            lines.append(line)
+    
+    text = '\n'.join(lines)
+    
+    # Clean up excessive whitespace while preserving paragraph structure
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = '\n'.join(line.rstrip() for line in text.split('\n')).strip()
+    
+    return text
+
+def clean_html_with_beautifulsoup(html):
+    """Enhanced HTML to text conversion using BeautifulSoup for better paragraph preservation."""
+    soup = BeautifulSoup(html, 'html.parser')
+    
+    # Remove scripts and styles
+    for tag in soup(['script', 'style', 'nav', 'header', 'footer']):
+        tag.decompose()
+    
+    # Process headings first to preserve their structure
+    for heading in soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
+        level = int(heading.name[1])
+        text = heading.get_text().strip()
+        if text:
+            if level == 1:
+                heading.replace_with(f"=== {text} ===\n\n")
+            elif level == 2:
+                heading.replace_with(f"== {text} ==\n\n")
+            else:
+                heading.replace_with(f"-- {text} --\n\n")
+    
+    # Handle block elements that should create paragraph breaks
+    block_elements = ['p', 'div', 'blockquote', 'pre', 'section', 'article', 'aside']
+    for tag in soup.find_all(block_elements):
+        # Add paragraph break after block elements
+        if tag.get_text().strip():
+            tag.append('\n\n')
+    
+    # Handle lists
+    for ul in soup.find_all('ul'):
+        for li in ul.find_all('li'):
+            li_text = li.get_text().strip()
+            if li_text:
+                li.replace_with(f"- {li_text}\n")
+        ul.append('\n')
+    
+    for ol in soup.find_all('ol'):
+        for i, li in enumerate(ol.find_all('li'), 1):
+            li_text = li.get_text().strip()
+            if li_text:
+                li.replace_with(f"{i}. {li_text}\n")
+        ol.append('\n')
+    
+    # Handle line breaks
+    for br in soup.find_all('br'):
+        br.replace_with('\n')
+    
+    # Handle tables - convert to simple text format
+    for table in soup.find_all('table'):
+        rows = []
+        for tr in table.find_all('tr'):
+            cells = [td.get_text().strip() for td in tr.find_all(['td', 'th'])]
+            if cells:
+                rows.append(' | '.join(cells))
+        if rows:
+            table.replace_with('\n'.join(rows) + '\n\n')
+    
+    # Get the text and clean it up
+    text = soup.get_text()
+    
+    # Normalize whitespace
+    text = re.sub(r'\r\n', '\n', text)
+    text = re.sub(r'\r', '\n', text)
+    
+    # Clean up multiple newlines but preserve paragraph structure
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    
+    # Remove trailing spaces from lines
+    lines = [line.rstrip() for line in text.split('\n')]
+    text = '\n'.join(lines).strip()
+    
+    return text
+
+def clean_html_regex(html):
+    """Fallback regex-based HTML to text conversion (original implementation)."""
     # Remove scripts/styles first
     text = re.sub(r'<script.*?>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r'<style.*?>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)
@@ -61,7 +190,7 @@ def clean_html(html):
 
     # Paragraph/block handling: only true text blocks cause paragraph breaks
     block_tags = (
-        'p|blockquote|pre|table|ul|ol|dl'
+        'p|blockquote|pre|table|ul|ol|dl|div|section|article'
     )
     # Closing blocks create paragraph breaks
     text = re.sub(rf'<\s*/\s*(?:{block_tags})\s*>', PARA, text, flags=re.IGNORECASE)
@@ -102,61 +231,6 @@ def clean_html(html):
 
     return text
 
-def clean_html_with_pandoc(html: str) -> str:
-    """Use BeautifulSoup + pypandoc to convert HTML to plain text, preserving paragraphing.
-
-    - Removes <script>/<style>
-    - Uses pandoc (if available) to convert HTML -> plain text with natural paragraph breaks
-    - Converts markdown-style headers to the same markers we use
-    - Keeps exactly one blank line between paragraphs
-    """
-    # Fallback if deps missing
-    if pypandoc is None or BeautifulSoup is None:
-        return clean_html(html)
-
-    # Remove scripts/styles and lightly normalize with BeautifulSoup
-    soup = BeautifulSoup(html, 'html.parser')
-    for tag in soup(['script', 'style']):
-        tag.decompose()
-
-    # Let pandoc do the heavy lifting
-    try:
-        text = pypandoc.convert_text(str(soup), 'plain', format='html', extra_args=['--wrap=none'])
-    except Exception:
-        return clean_html(html)
-
-    # Normalize newlines
-    text = text.replace('\r\n', '\n').replace('\r', '\n')
-
-    # Convert markdown-style headings to our markers
-    def _md_heading_to_markers(line: str) -> str:
-        s = line.strip()
-        # Pandoc typically emits atx headers like '#', '##', ... in plain output
-        if s.startswith('# '):
-            return f"=== {s[2:].strip()} ==="
-        if s.startswith('## '):
-            return f"== {s[3:].strip()} =="
-        if s.startswith('### '):
-            return f"-- {s[4:].strip()} --"
-        if s.startswith('#### '):
-            return f"-- {s[5:].strip()} --"
-        if s.startswith('##### '):
-            return f"-- {s[6:].strip()} --"
-        if s.startswith('###### '):
-            return f"-- {s[7:].strip()} --"
-        return line
-
-    lines = [
-        _md_heading_to_markers(l)
-        for l in text.split('\n')
-    ]
-    text = '\n'.join(lines)
-
-    # Ensure exactly one blank line after headings and between paragraphs
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    # Trim trailing spaces per line
-    text = '\n'.join(line.rstrip() for line in text.split('\n')).strip()
-    return text
 
 def _safe_filename(name: str) -> str:
     name = name.strip()
@@ -189,7 +263,7 @@ def _derive_title(plain_text: str) -> str:
             return s[:120]
     return "Untitled"
 
-def extract_epub(epub_file, output_dir, extract_images=True, use_pandoc=False):
+def extract_epub(epub_file, output_dir, extract_images=True):
     # Create a subfolder under output_dir based on EPUB filename
     epub_basename = os.path.splitext(os.path.basename(epub_file))[0]
     safe_epub_name = _safe_filename(epub_basename)
@@ -215,10 +289,8 @@ def extract_epub(epub_file, output_dir, extract_images=True, use_pandoc=False):
     chapter_num = 1
     for item in book.get_items_of_type(ITEM_DOCUMENT):
         content = item.get_content().decode("utf-8", errors="ignore")
-        if use_pandoc:
-            plain_text = clean_html_with_pandoc(content)
-        else:
-            plain_text = clean_html(content)
+       
+        plain_text = clean_html(content)
         # Build intuitive filename using detected title or first meaningful line
         title_guess = _derive_title(plain_text)
         safe_title = _safe_filename(title_guess)
@@ -253,7 +325,8 @@ def main():
     parser.add_argument("-i", "--input", required=True, help="Path to the EPUB file")
     parser.add_argument("-o", "--output", default="epub_output", help="Output folder for text/images")
     parser.add_argument("--images", action="store_true", help="Extract images as well")
-    parser.add_argument("--pandoc", action="store_true", help="Use BeautifulSoup + pypandoc to preserve paragraphing")
+    parser.add_argument("--converter", choices=['auto', 'html2text', 'beautifulsoup', 'regex'], 
+                       default='auto', help="Choose HTML to text converter (auto uses best available)")
     args = parser.parse_args()
 
     if not os.path.exists(args.input):
@@ -261,10 +334,19 @@ def main():
         return
 
     print(f"Processing '{args.input}' ...")
-    if args.pandoc and (pypandoc is None or BeautifulSoup is None):
-        print("⚠️  --pandoc requested but pypandoc/BeautifulSoup not available. Falling back to built-in converter.")
-    use_pandoc = bool(args.pandoc and pypandoc is not None and BeautifulSoup is not None)
-    extract_epub(args.input, args.output, args.images, use_pandoc)
+    
+    # Show available converters
+    available_converters = []
+    if html2text is not None:
+        available_converters.append("html2text")
+    if BeautifulSoup is not None:
+        available_converters.append("BeautifulSoup")
+    available_converters.append("regex")
+    
+    print(f"Available HTML converters: {', '.join(available_converters)}")
+    
+
+    extract_epub(args.input, args.output, args.images)
 
 if __name__ == "__main__":
     main()
